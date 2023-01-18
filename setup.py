@@ -11,7 +11,7 @@ def find_version():
         ),
         "r",
     ) as file:
-        return re.search('__version__ = "(\d+\.\d+\.\d+)"', file.read()).group(
+        return re.search("__version__ = '(.*?)'", file.read()).group(
             1
         )
 
