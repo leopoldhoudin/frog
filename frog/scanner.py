@@ -1,7 +1,10 @@
 from datetime import date
+from collections import namedtuple
+from collections import defaultdict
 from re import compile as compile_regex
 from subprocess import PIPE
 from subprocess import Popen
+from typing import List
 
 from progress.bar import ChargingBar
 
@@ -12,93 +15,110 @@ from frog.core import File
 from frog.terminal import term
 
 
-commit_regex = compile_regex(r'([0-9a-f]{40}):(\d{4}-\d{2}-\d{2}):(.*?):(.*)')
-change_regex = compile_regex(r'(\w)\s+(.*?)$')
+RawCommit = namedtuple('RawCommit', 'hash, date, auth, subj')
+
+
+regex_commit = compile_regex(r'([0-9a-f]{40}):(\d{4}-\d{2}-\d{2}):(.*?):(.*)')
+# regex_change = compile_regex(r'(\w)\s+(.*?)$')
+regex_change = compile_regex(r'(\d+)\s+(\d+)\s+(.*)$')
 
 
 def scan_project() -> Project:
     term.head('🔎 Scanning project...')
 
-    project = Project()
-
-    _scan_history(project)
-    _scan_commits(project)
+    raw_commits = _scan_history()
+    project = _scan_commits(raw_commits)
 
     term.done('Completed\n')
 
     return project
 
 
-def _scan_history(project: Project):
+def _scan_history() -> List[RawCommit]:
     term.info('Scanning history...')
+    commits = []
 
-    proc = Popen(
-        ['git', '--no-pager', 'log', '--full-history', '--reverse', '--format="%H:%as:%ae:%s"'],
-        stdout=PIPE,
-    )
-
-    contrib = {}
-
+    proc = Popen(_make_gitcmd_logs(), stdout=PIPE)
     while True:
         line = proc.stdout.readline()
         if not line: break
-        line = line.decode().rstrip('\n').strip('"')
 
-        commit_match = commit_regex.match(line)
-
-        if commit_match:
-            author_name = commit_match.group(3)
-            author_info = contrib.get(author_name)
-            if author_info is None:
-                contrib[author_name] = author_info = (Contributor(author_name), [])
-
-            commit = Commit(
-                commit_match.group(1),
-                date.fromisoformat(commit_match.group(2)),
-                author_info[0],
-                commit_match.group(4),
+        match_commit = regex_commit.match(_clean_raw_line(line))
+        if match_commit:
+            commit = RawCommit(
+                match_commit.group(1),
+                date.fromisoformat(match_commit.group(2)),
+                match_commit.group(3),
+                match_commit.group(4),
             )
 
-            author_info[1].append(commit)
-            project._add_commit(commit)
+            commits.append(commit)
 
     proc.stdout.close()
     proc.wait()
 
-    for contributor, commits in contrib.values():
-        contributor._set_commits(commits)
-        project._add_contrib(contributor)
+    return commits
 
 
-def _scan_commits(project: Project):
+def _make_gitcmd_logs() -> List[str]:
+    return ['git', '--no-pager', 'log', '--full-history', '--reverse', '--format="%H:%as:%ae:%s"']
+
+
+def _scan_commits(raw_commits: List[RawCommit]) -> Project:
     bar = ChargingBar(
         '   Scanning commits...',
-        max=len(project.commits),
+        max=len(raw_commits),
         suffix='%(percent)d%% (%(index)d/%(max)d)',
     )
-    files_commits = {}
-    for commit in project.commits:
-        proc = Popen(
-            ['git', 'diff-tree', '--no-commit-id', '--name-status', '-r', commit.hash],
-            stdout=PIPE,
-        )
 
+    commits = []
+    contribs = defaultdict(list)
+    files = defaultdict(list)
+    for raw_commit in raw_commits:
+        adds, dels = 0, 0
+        paths = []
+
+        proc = Popen(_make_gitcmd_show(raw_commit.hash), stdout=PIPE)
         while True:
             line = proc.stdout.readline()
             if not line: break
-            line = line.decode().rstrip('\n').strip('"')
 
-            change_match = change_regex.match(line)
-            if change_match:
-                file_path = change_match.group(2)
-                file_commits = files_commits.get(file_path)
-                if file_commits is None:
-                    files_commits[file_path] = file_commits = []
+            match_change = regex_change.match(_clean_raw_line(line))
+            if match_change:
+                adds += int(match_change.group(1))
+                dels += int(match_change.group(2))
+                paths.append(match_change.group(3))
 
-                file_commits.append(commit)
+        commit = Commit(
+            raw_commit.hash,
+            raw_commit.date,
+            raw_commit.subj,
+            len(paths),
+            adds,
+            dels,
+        )
 
-        for file_path, file_commits in files_commits.items():
-            project._add_file(File(file_path, file_commits))
+        commits.append(commit)
+        contribs[raw_commit.auth].append(commit)
+        for path in paths:
+            files[path].append(commit)
+
+        proc.stdout.close()
+        proc.wait()
 
         bar.next()
     bar.finish()
+
+    return Project(
+        commits,
+        [Contributor(*contrib) for contrib in contribs.items()],
+        [File(*file) for file in files.items()],
+    )
+
+
+def _make_gitcmd_show(commit_hash: str) -> List[str]:
+    return ['git', '--no-pager', 'show', '--format=', commit_hash, '--numstat']
+
+
+def _clean_raw_line(raw_line: bytes) -> str:
+    return raw_line.decode().rstrip('\n').strip('"')
